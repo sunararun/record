@@ -1,0 +1,10 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: Recorded
+
+app:
+  service:
+    url: https://jsonplaceholder.typicode.com/comments
