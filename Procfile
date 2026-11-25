@@ -1,0 +1,1 @@
+web: java -Xms256m -Xmx512m -jar  -Dserver.port=8090 -jar target/application.jar

@@ -1,26 +1,43 @@
-image: eclipse-temurin:21
+image: maven:3-eclipse-temurin-21
 
 clone:
-  depth: full              # SonarQube Cloud scanner needs the full history to assign issues properly
+  depth: full
 
 definitions:
   caches:
-    sonar: ~/.sonar/cache  # Caching SonarQube Cloud artifacts will speed up your build
+    sonar: ~/.sonar/cache
   steps:
     - step: &build-test-sonarcloud
         name: Build, test and analyze on SonarQube Cloud
         caches:
-          - gradle
+          - maven
           - sonar
         script:
-          - ./gradlew build sonar
+          - mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.token=$SONAR_TOKEN -Dsonar.qualitygate.wait=true
         artifacts:
-          - build/libs/**
+          - target/**
+        reports:
+          surefire: 'target/surefire-reports/*.xml'
+          jacoco: 'target/site/jacoco/jacoco.xml'
 
-pipelines:                 # More info here: https://confluence.atlassian.com/bitbucket/configure-bitbucket-pipelines-yml-792298910.html
+    - step: &trigger-jenkins-main
+        name: Trigger Jenkins MAIN Build
+        script:
+          - CLEAN_URL=$(echo "${JENKINS_URL}" | sed 's/\/$//')
+          - curl -f -X POST -H "ngrok-skip-browser-warning:true" -u "${JENKINS_USER}:${JENKINS_TOKEN}" "${CLEAN_URL}/job/${JENKINS_JOB_NAME}/build"
+
+    - step: &trigger-jenkins-qa
+        name: Trigger Jenkins QA Build
+        script:
+          - CLEAN_URL=$(echo "${JENKINS_URL}" | sed 's/\/$//')
+          # Uses the QA specific job name variable
+          - curl -f -X POST -H "ngrok-skip-browser-warning:true" -u "${JENKINS_USER}:${JENKINS_TOKEN}" "${CLEAN_URL}/job/${JENKINS_QA_JOB_NAME}/build"
+
+pipelines:
   branches:
-    master:
+    main:
       - step: *build-test-sonarcloud
-  pull-requests:
-    '**':
-      - step: *build-test-sonarcloud
+      - step: *trigger-jenkins-main
+
+    QA:
+      - step: *trigger-jenkins-qa
