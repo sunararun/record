@@ -1,0 +1,182 @@
+// Requires the "Active Choices" plugin.
+// ECR_REPO  : dropdown of all repositories in the registry
+// IMAGE_TAG : dropdown of tags in the chosen repository (newest first), refreshes when ECR_REPO changes
+properties([
+    parameters([
+        [$class: 'ChoiceParameter',
+            choiceType: 'PT_SINGLE_SELECT',
+            name: 'ECR_REPO',
+            description: 'ECR repository',
+            filterable: true,
+            script: [$class: 'GroovyScript',
+                fallbackScript: [classpath: [], sandbox: false, script: 'return ["Could not load repositories - check script approval"]'],
+                script: [classpath: [], sandbox: false, script: '''
+                    import com.cloudbees.plugins.credentials.CredentialsProvider
+                    import com.cloudbees.plugins.credentials.common.StandardCredentials
+                    import jenkins.model.Jenkins
+
+                    def credId = 'aws config'
+                    def region = 'ap-south-1'
+
+                    try {
+                        def cred = CredentialsProvider.lookupCredentials(StandardCredentials.class, Jenkins.get(), null, null).find { it.id == credId }
+                        if (cred == null) {
+                            return ["ERROR: credential " + credId + " not found"]
+                        }
+                        def aws = cred.getCredentials()
+
+                        def envList = System.getenv().collect { k, v -> k + "=" + v }
+                        envList << ("AWS_ACCESS_KEY_ID=" + aws.getAWSAccessKeyId())
+                        envList << ("AWS_SECRET_ACCESS_KEY=" + aws.getAWSSecretKey())
+                        envList << ("AWS_DEFAULT_REGION=" + region)
+
+                        def cmd = ["aws", "ecr", "describe-repositories", "--region", region,
+                                   "--query", "repositories[].repositoryName", "--output", "text"]
+                        def proc = cmd.execute(envList, null)
+                        def out = new StringBuilder()
+                        def err = new StringBuilder()
+                        proc.consumeProcessOutput(out, err)
+                        proc.waitFor()
+
+                        if (proc.exitValue() != 0) {
+                            return ["ERROR: " + err.toString().trim()]
+                        }
+                        def repos = out.toString().tokenize().sort()
+                        return repos ? repos : ["No repositories found"]
+                    } catch (Exception e) {
+                        return ["ERROR: " + e.getMessage()]
+                    }
+                ''']
+            ]
+        ],
+
+        [$class: 'CascadeChoiceParameter',
+            choiceType: 'PT_SINGLE_SELECT',
+            name: 'IMAGE_TAG',
+            description: 'Image tag (newest first)',
+            referencedParameters: 'ECR_REPO',
+            filterable: true,
+            script: [$class: 'GroovyScript',
+                fallbackScript: [classpath: [], sandbox: false, script: 'return ["Could not load tags - check script approval"]'],
+                script: [classpath: [], sandbox: false, script: '''
+                    import com.cloudbees.plugins.credentials.CredentialsProvider
+                    import com.cloudbees.plugins.credentials.common.StandardCredentials
+                    import jenkins.model.Jenkins
+
+                    def credId = 'aws config'
+                    def region = 'ap-south-1'
+                    def max    = 30
+
+                    try {
+                        if (!ECR_REPO || ECR_REPO.startsWith("ERROR") || ECR_REPO.startsWith("No ") || ECR_REPO.startsWith("Could not")) {
+                            return ["Select a repository first"]
+                        }
+                        def cred = CredentialsProvider.lookupCredentials(StandardCredentials.class, Jenkins.get(), null, null).find { it.id == credId }
+                        if (cred == null) {
+                            return ["ERROR: credential " + credId + " not found"]
+                        }
+                        def aws = cred.getCredentials()
+
+                        def envList = System.getenv().collect { k, v -> k + "=" + v }
+                        envList << ("AWS_ACCESS_KEY_ID=" + aws.getAWSAccessKeyId())
+                        envList << ("AWS_SECRET_ACCESS_KEY=" + aws.getAWSSecretKey())
+                        envList << ("AWS_DEFAULT_REGION=" + region)
+
+                        def cmd = ["aws", "ecr", "describe-images", "--repository-name", ECR_REPO, "--region", region,
+                                   "--query", "imageDetails[].[imagePushedAt,imageTags[0]]", "--output", "text"]
+                        def proc = cmd.execute(envList, null)
+                        def out = new StringBuilder()
+                        def err = new StringBuilder()
+                        proc.consumeProcessOutput(out, err)
+                        proc.waitFor()
+
+                        if (proc.exitValue() != 0) {
+                            return ["ERROR: " + err.toString().trim()]
+                        }
+
+                        def rows = []
+                        out.toString().readLines().each { line ->
+                            def p = line.tokenize()
+                            // skip untagged images (tag shows as None)
+                            if (p.size() >= 2 && p[1] != "None") {
+                                rows << [p[0], p[1]]
+                            }
+                        }
+                        rows = rows.sort { a, b -> b[0] <=> a[0] }
+                        def tags = rows.collect { it[1] }.take(max)
+                        return tags ? tags : ["No tagged images found"]
+                    } catch (Exception e) {
+                        return ["ERROR: " + e.getMessage()]
+                    }
+                ''']
+            ]
+        ]
+    ])
+])
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_CREDS_ID = 'aws config'                 // Jenkins credential ID (AWS Credentials)
+        AWS_REGION   = 'ap-south-1'
+        ACCOUNT_ID   = '501591550267'               // taken from your S3 bucket name; check it matches your registry
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Validate selection') {
+            steps {
+                script {
+                    def bad = ['ERROR', 'No ', 'Could not', 'Select a']
+                    if (!params.ECR_REPO || !params.IMAGE_TAG || bad.any { params.ECR_REPO.startsWith(it) || params.IMAGE_TAG.startsWith(it) }) {
+                        error "Invalid selection: repo='${params.ECR_REPO}', tag='${params.IMAGE_TAG}'"
+                    }
+                    env.IMAGE_URI = "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${params.ECR_REPO}:${params.IMAGE_TAG}"
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${params.ECR_REPO}:${params.IMAGE_TAG}"
+                    echo "Selected image: ${env.IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Verify image exists in ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                    bat '''
+                        @echo off
+                        aws ecr describe-images --repository-name "%ECR_REPO%" --image-ids imageTag=%IMAGE_TAG% --region "%AWS_REGION%" --query "imageDetails[0].[imageDigest,imagePushedAt]" --output table
+                        if errorlevel 1 exit /b 1
+                    '''
+                }
+            }
+        }
+
+        stage('Use the image') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                    bat '''
+                        @echo off
+                        echo Image to deploy: %IMAGE_URI%
+
+                        rem Example: log in to ECR and pull the selected image
+                        rem aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com
+                        rem docker pull %IMAGE_URI%
+
+                        rem Replace the lines above with your real deploy step, for example updating an ECS service,
+                        rem a Kubernetes deployment, or an Elastic Beanstalk Dockerrun.aws.json that points to %IMAGE_URI%.
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo "Done: ${env.IMAGE_URI}" }
+        failure { echo "Failed. Check the console log." }
+    }
+}
