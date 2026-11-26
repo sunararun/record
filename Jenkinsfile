@@ -46,7 +46,7 @@ pipeline {
                     // helper scripts live in the repo's deployment-scripts/ folder (checked out above)
                     packaging = load 'deployment-scripts/packaging.groovy'
                     s3Upload  = load 'deployment-scripts/s3Upload.groovy'
-                    ebDeploy  = load 'deployment-scripts/ebDeploy.groovy'
+                    ebDeploy  = load 'deployment-scripts/beanStalkDeploy.groovy'
                 }
             }
         }
