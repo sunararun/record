@@ -1,83 +1,209 @@
+// Requires the "Active Choices" plugin (Manage Jenkins > Plugins > Available plugins).
+// The S3_KEY dropdown is filled when the "Build with Parameters" form opens.
+properties([
+    parameters([
+        string(name: 'APP_NAME', defaultValue: 'record',      description: 'Elastic Beanstalk application name'),
+        string(name: 'ENV_NAME', defaultValue: 'record-dev-env', description: 'Elastic Beanstalk environment to roll back'),
+        [$class: 'ChoiceParameter',
+            choiceType: 'PT_SINGLE_SELECT',
+            name: 'S3_KEY',
+            description: 'All files found in S3 (newest first)',
+            filterable: true,
+            script: [$class: 'GroovyScript',
+                fallbackScript: [classpath: [], sandbox: false, script: 'return ["Could not load list - check script approval"]'],
+                script: [classpath: [], sandbox: false, script: '''
+                    import com.cloudbees.plugins.credentials.CredentialsProvider
+                    import com.cloudbees.plugins.credentials.common.StandardCredentials
+                    import jenkins.model.Jenkins
+
+                    def credId = 'aws config'
+                    def bucket = 'elasticbeanstalk-ap-south-1-501591550267'
+                    def prefix = 'recorded/'
+                    def region = 'ap-south-1'
+                    def max    = 20
+
+                    try {
+                        def cred = CredentialsProvider.lookupCredentials(StandardCredentials.class, Jenkins.get(), null, null).find { it.id == credId }
+                        if (cred == null) {
+                            return ["ERROR: credential " + credId + " not found"]
+                        }
+                        def aws = cred.getCredentials()
+
+                        def envList = System.getenv().collect { k, v -> k + "=" + v }
+                        envList << ("AWS_ACCESS_KEY_ID=" + aws.getAWSAccessKeyId())
+                        envList << ("AWS_SECRET_ACCESS_KEY=" + aws.getAWSSecretKey())
+                        envList << ("AWS_DEFAULT_REGION=" + region)
+
+                        def cmd = ["aws", "s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
+                                   "--region", region, "--query", "Contents[].[LastModified,Key]", "--output", "text"]
+                        def proc = cmd.execute(envList, null)
+                        def out = new StringBuilder()
+                        def err = new StringBuilder()
+                        proc.consumeProcessOutput(out, err)
+                        proc.waitFor()
+
+                        if (proc.exitValue() != 0) {
+                            return ["ERROR: " + err.toString().trim()]
+                        }
+
+                        def rows = []
+                        out.toString().readLines().each { line ->
+                            def p = line.tokenize()
+                            if (p.size() >= 2 && !p[1].endsWith("/")) {
+                                rows << [p[0], p[1]]
+                            }
+                        }
+                        rows = rows.sort { a, b -> b[0] <=> a[0] }
+                        def keys = rows.collect { it[1] }.take(max)
+                        return keys ? keys : ["No files found"]
+                    } catch (Exception e) {
+                        return ["ERROR: " + e.getMessage()]
+                    }
+                ''']
+            ]
+        ]
+    ])
+])
+
 pipeline {
     agent any
 
     environment {
-        REPO_URL     = 'https://bitbucket.org/awseb1584/recorded.git'
-        BRANCH       = 'main'                    // change if needed
-        PACKAGE_DIR  = 'package'
-        ZIP_NAME     = 'recorded.zip'
-
-        // S3 upload settings
-        AWS_CREDS_ID = 'aws config'              // Jenkins credential ID (AWS Credentials)
+        AWS_CREDS_ID = 'aws config'   // Jenkins credential ID (AWS Credentials)
         S3_BUCKET    = 'elasticbeanstalk-ap-south-1-501591550267'
         AWS_REGION   = 'ap-south-1'
-        S3_PREFIX    = 'recorded'                // folder inside the bucket
+        S3_PREFIX    = 'recorded'
     }
 
-   /* tools {
-        maven 'Maven3'    // name configured in Manage Jenkins > Tools
-        jdk   'JDK17'     // name configured in Manage Jenkins > Tools
-    }*/
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
 
     stages {
 
-        stage('Checkout') {
+        stage('Resolve version') {
             steps {
-                git branch: "${BRANCH}",
-                        url: "${REPO_URL}",
-                        credentialsId: 'BitBucketLink'   // Username/App password credential
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                    script {
+                        def key = params.S3_KEY?.trim()
+                        if (!key || key.startsWith('ERROR') || key.startsWith('No ') || key.startsWith('Could not')) {
+                            error "Invalid S3_KEY selected: '${key}'"
+                        }
+                        env.S3_KEY_SELECTED = key
 
-                script {
-                    // helper scripts live in the repo's deployment-scripts/ folder (checked out above)
-                    packaging = load 'deployment-scripts/packaging.groovy'
-                    s3Upload  = load 'deployment-scripts/s3Upload.groovy'
+                        // Reuse the EB version label if this S3 file is already registered
+                        def existing = bat(returnStdout: true, script: '''
+                            @echo off
+                            aws elasticbeanstalk describe-application-versions --application-name "%APP_NAME%" --region "%AWS_REGION%" --query "ApplicationVersions[?SourceBundle.S3Key=='%S3_KEY_SELECTED%'].VersionLabel" --output text
+                        ''').trim()
+                        def label = existing ? existing.split(/\s+/)[0] : ''
+
+                        if (label && label != 'None') {
+                            env.TARGET_VERSION = label
+                            env.REGISTER_NEW = 'false'
+                        } else {
+                            def rel = key.startsWith(env.S3_PREFIX + '/') ? key.substring(env.S3_PREFIX.length() + 1) : key
+                            def noExt = rel.contains('.') ? rel.substring(0, rel.lastIndexOf('.')) : rel
+                            env.TARGET_VERSION = (params.APP_NAME + '-' + noExt.replaceAll('[^A-Za-z0-9._-]', '-')).take(100)
+                            env.REGISTER_NEW = 'true'
+                        }
+
+                        currentBuild.displayName = "#${env.BUILD_NUMBER} -> ${env.TARGET_VERSION}"
+                        echo "S3 file: ${env.S3_KEY_SELECTED}"
+                        echo "EB version label: ${env.TARGET_VERSION} (register new: ${env.REGISTER_NEW})"
+                    }
                 }
             }
         }
 
-        stage('Build') {
+        stage('Verify file and register version') {
             steps {
-                bat 'mvn clean package -DskipTests'
-            }
-        }
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                    bat '''
+                        @echo off
 
-        stage('Prepare Package') {
-            steps {
-                script {
-                    packaging.preparePackage()
+                        echo Checking S3 object: s3://%S3_BUCKET%/%S3_KEY_SELECTED%
+                        aws s3api head-object --bucket "%S3_BUCKET%" --key "%S3_KEY_SELECTED%" --region "%AWS_REGION%" > NUL
+                        if errorlevel 1 (
+                            echo ERROR: file not found in S3
+                            exit /b 1
+                        )
+
+                        if "%REGISTER_NEW%"=="true" (
+                            echo Registering %TARGET_VERSION% in Elastic Beanstalk...
+                            aws elasticbeanstalk create-application-version --application-name "%APP_NAME%" --version-label "%TARGET_VERSION%" --source-bundle "S3Bucket=%S3_BUCKET%,S3Key=%S3_KEY_SELECTED%" --region "%AWS_REGION%"
+                            if errorlevel 1 exit /b 1
+                        )
+                    '''
                 }
             }
         }
 
-        stage('Create Zip') {
+        stage('Show current version') {
             steps {
-                script {
-                    packaging.createZip()
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                    bat '''
+                        @echo off
+                        echo Currently deployed version:
+                        aws elasticbeanstalk describe-environments --environment-names "%ENV_NAME%" --region "%AWS_REGION%" --query "Environments[0].[EnvironmentName,VersionLabel,Health,Status]" --output table
+                        if errorlevel 1 exit /b 1
+                    '''
                 }
             }
         }
 
-        stage('Upload to S3') {
+        stage('Rollback') {
             steps {
-                script {
-                    s3Upload.uploadZip(
-                        credentialsId: env.AWS_CREDS_ID,
-                        bucket       : env.S3_BUCKET,
-                        region       : env.AWS_REGION,
-                        zipName      : env.ZIP_NAME,
-                        prefix       : env.S3_PREFIX
-                    )
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                    bat '''
+                        @echo off
+                        aws elasticbeanstalk update-environment --environment-name "%ENV_NAME%" --version-label "%TARGET_VERSION%" --region "%AWS_REGION%"
+                        if errorlevel 1 exit /b 1
+                    '''
                 }
             }
         }
+
+       stage('Wait for environment') {
+           steps {
+               withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDS_ID]]) {
+                   script {
+                       def status = ''
+                       def health = ''
+                       def version = ''
+                       timeout(time: 20, unit: 'MINUTES') {
+                           waitUntil(initialRecurrencePeriod: 15000) {
+                               def out = bat(returnStdout: true, script: '''
+                                   @echo off
+                                   aws elasticbeanstalk describe-environments --environment-names "%ENV_NAME%" --region "%AWS_REGION%" --query "Environments[0].[Status,Health,VersionLabel]" --output text
+                               ''').trim()
+                               def p = out.split(/\s+/)
+                               status = p[0]
+                               health = p[1]
+                               version = p[2]
+                               echo "Status=${status} Health=${health} Version=${version}"
+                               return status == 'Ready'
+                           }
+                       }
+                       if (version != env.TARGET_VERSION) {
+                           error "Environment is on ${version}, expected ${env.TARGET_VERSION}"
+                       }
+                       if (health == 'Red') {
+                           error "Rollback finished but environment health is Red"
+                       }
+                   }
+               }
+           }
+       }
     }
 
     post {
         success {
-            archiveArtifacts artifacts: "${ZIP_NAME}", fingerprint: true
+            echo "Rolled back ${params.ENV_NAME} to ${env.TARGET_VERSION}"
         }
         failure {
-            echo 'Build failed'
+            echo "Rollback failed. Check the console log and the EB events for ${params.ENV_NAME}."
         }
     }
 }
